@@ -1,0 +1,46 @@
+name: Daily Price Scan
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+    - cron: "15 14 * * *"
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Batch size of games to scan"
+        required: false
+        default: "100"
+
+concurrency:
+  group: steam-price-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Execute Price Batch Scan
+        run: pnpm run test:unit
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
