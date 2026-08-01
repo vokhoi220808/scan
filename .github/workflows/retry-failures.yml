@@ -5,36 +5,23 @@ on:
     - cron: "30 8 * * *"
   workflow_dispatch:
 
-concurrency:
-  group: steam-price-scan
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-
 jobs:
   retry:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Retry Failed Sync Items
-        run: pnpm run test:unit
+      - name: Run Standalone Retry Scan
+        run: |
+          npm init -y
+          npm install @neondatabase/serverless
+          node .github/workflows/standalone-scan.js
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
