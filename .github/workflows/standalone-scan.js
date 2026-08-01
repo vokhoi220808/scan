@@ -16,16 +16,10 @@ const TOP_POPULAR_APP_IDS = [
   1172470, 252490, 359550, 1086940, 1172620, 1599340, 1938090, 548430, 1085660, 1623730
 ];
 
-// Generate 2-letter & 3-letter search combinations for massive catalog discovery
+// Alphabet & keyword search triggers
 const SEARCH_KEYWORDS = [];
-for (let i = 97; i <= 122; i++) {
-  for (let j = 97; j <= 122; j++) {
-    SEARCH_KEYWORDS.push(String.fromCharCode(i) + String.fromCharCode(j));
-  }
-}
-// Add high-volume 3-letter game tags
-const EXTRA_TAGS = ["pro", "sim", "war", "run", "red", "out", "sub", "sea", "sky", "fly", "bot", "god", "man", "one", "box", "pub", "rpg", "fps"];
-SEARCH_KEYWORDS.push(...EXTRA_TAGS);
+for (let i = 97; i <= 122; i++) SEARCH_KEYWORDS.push(String.fromCharCode(i));
+for (let i = 0; i <= 9; i++) SEARCH_KEYWORDS.push(String(i));
 
 async function ensureTables() {
   console.log("🛠 Verifying/Creating PostgreSQL tables in Neon...");
@@ -104,9 +98,9 @@ async function ensureTables() {
 }
 
 /**
- * Fetch top popular games list dynamically across multiple Steam Store endpoints (Target 20,000+)
+ * Fetch top popular games list dynamically across multiple Steam Store endpoints
  */
-async function getMassiveTargetAppIds(limit = 20000) {
+async function getTopTargetAppIds(limit = 10000) {
   const resultAppIds = [];
   const seen = new Set();
 
@@ -142,29 +136,12 @@ async function getMassiveTargetAppIds(limit = 20000) {
     console.warn("Could not fetch Steam featured specials:", err?.message || err);
   }
 
-  // Priority 3: Fetch existing tracked games from Neon DB
-  try {
-    const dbGames = await sql`
-      SELECT g.app_id 
-      FROM games g
-      LEFT JOIN current_prices cp ON cp.game_id = g.id
-      WHERE g.is_tracked = 1
-      ORDER BY cp.is_on_sale DESC, cp.source_checked_at ASC
-      LIMIT ${limit}
-    `;
-    if (dbGames) {
-      dbGames.forEach((g) => add(Number(g.app_id)));
-    }
-  } catch {
-    // Table might be brand new
-  }
-
-  // Priority 4: Multi-Keyword Parallel Search Engine to reach target limit
-  console.log(`🌐 Searching Steam Store across keywords to build massive target scan list...`);
-  for (const prefix of SEARCH_KEYWORDS) {
+  // Priority 3: Search keyword loop until limit is reached
+  console.log(`🌐 Searching Steam Store across keywords to build target ${limit} games list...`);
+  for (const keyword of SEARCH_KEYWORDS) {
     if (resultAppIds.length >= limit) break;
     try {
-      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(prefix)}&cc=VN&l=vietnamese&start=0&count=50`;
+      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(keyword)}&cc=VN&l=vietnamese&start=0&count=50`;
       const searchRes = await fetch(searchUrl, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
       if (!searchRes.ok) continue;
       const searchData = await searchRes.json();
@@ -172,24 +149,42 @@ async function getMassiveTargetAppIds(limit = 20000) {
       items.forEach((item) => {
         if (item?.id) add(Number(item.id));
       });
-      await new Promise((r) => setTimeout(r, 40)); // High-speed 40ms delay
+      await new Promise((r) => setTimeout(r, 100));
     } catch {
       // Ignore individual search term errors
     }
   }
 
-  console.log(`🎯 Final Target scan list ready: ${resultAppIds.length} games scheduled for scan.`);
+  console.log(`🎯 Target App ID pool ready: ${resultAppIds.length} candidate games.`);
   return resultAppIds.slice(0, limit);
 }
 
-async function scanGame(appId) {
+/**
+ * Robust Game detail fetcher with Exponential Backoff on 429 Rate Limits
+ */
+async function scanGame(appId, retries = 3) {
   const url = `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=VN&l=vietnamese`;
-  const res = await fetch(url, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
-  if (!res.ok) return null;
-  const data = await res.json();
-  const entry = data[appId];
-  if (!entry?.success || !entry.data) return null;
-  return entry.data;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
+      if (res.status === 429) {
+        // Steam rate-limiting: exponential backoff wait 2.5s -> 5s -> 10s
+        const waitMs = (attempt + 1) * 2500;
+        console.warn(`⚠️ Steam Rate Limited (429) on appId ${appId}. Cooling down ${waitMs / 1000}s...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      if (!res.ok) return null;
+      const data = await res.json();
+      const entry = data[appId];
+      if (!entry?.success || !entry.data) return null;
+      return entry.data;
+    } catch (err) {
+      if (attempt === retries) return null;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  return null;
 }
 
 /**
@@ -216,7 +211,7 @@ async function processSingleGame(appId) {
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `app-${appId}`;
   const fingerprint = [gameId, "VND", initialPrice, finalPrice, discountPercent, isFree].join(":");
 
-  // 1. Upsert game with rich metadata
+  // 1. Upsert game
   await sql`
     INSERT INTO games (
       id, app_id, name, slug, type, short_description, developer, publisher,
@@ -244,13 +239,13 @@ async function processSingleGame(appId) {
     ON CONFLICT (game_id, currency) DO UPDATE SET initial_price = ${initialPrice}, final_price = ${finalPrice}, discount_percent = ${discountPercent}, source_checked_at = ${now}, updated_at = ${now};
   `;
 
-  // 3. Insert price history on price change
+  // 3. Upsert price history
   await sql`
     INSERT INTO price_history (id, game_id, currency, initial_price, final_price, discount_percent, is_free, is_on_sale, fingerprint, source, recorded_at)
     VALUES (${`phist_${appId}_${Date.now()}`}, ${gameId}, 'VND', ${initialPrice}, ${finalPrice}, ${discountPercent}, ${isFree}, ${discountPercent > 0 ? 1 : 0}, ${fingerprint}, 'steam_store', ${now});
   `;
 
-  // 4. Upsert lowest price (All-Time Low)
+  // 4. Upsert lowest price
   await sql`
     INSERT INTO lowest_prices (id, game_id, currency, price, first_recorded_at, last_recorded_at, updated_at)
     VALUES (${`lowest_${appId}`}, ${gameId}, 'VND', ${finalPrice}, ${now}, ${now}, ${now})
@@ -260,30 +255,34 @@ async function processSingleGame(appId) {
       updated_at = EXCLUDED.updated_at;
   `;
 
-  console.log(`✅ [SCANNED] ${name} (${appId}): ${finalPrice.toLocaleString("vi-VN")} VND (-${discountPercent}%)`);
   return true;
 }
 
 async function run() {
-  console.log("🚀 Starting Elite Parallel High-Performance Steam Scanner against Neon Database...");
+  console.log("🚀 Starting Rate-Limit Protected Steam Price Scan against Neon Database...");
   await ensureTables();
 
-  const scanLimit = parseInt(process.env.BATCH_SIZE || "20000", 10);
-  const targetAppIds = await getMassiveTargetAppIds(scanLimit);
+  const scanLimit = parseInt(process.env.BATCH_SIZE || "10000", 10);
+  const targetAppIds = await getTopTargetAppIds(scanLimit);
   let successCount = 0;
-  const CONCURRENCY = 5; // 5 parallel streams for maximum speed
+  let processedCount = 0;
 
-  console.log(`🔥 Executing Parallel Scan Engine for ${targetAppIds.length} games (Concurrency: ${CONCURRENCY})...`);
+  console.log(`🔥 Executing Rate-Protected Scan for ${targetAppIds.length} candidate games...`);
 
-  for (let i = 0; i < targetAppIds.length; i += CONCURRENCY) {
-    const chunk = targetAppIds.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(chunk.map((appId) => processSingleGame(appId)));
-    successCount += results.filter(Boolean).length;
-    console.log(`⚡ Progress: ${successCount}/${targetAppIds.length} games processed.`);
-    await new Promise((r) => setTimeout(r, 200)); // Smooth 200ms delay between parallel batches
+  for (const appId of targetAppIds) {
+    processedCount++;
+    const ok = await processSingleGame(appId);
+    if (ok) {
+      successCount++;
+      if (successCount % 10 === 0 || successCount === 1) {
+        console.log(`✅ [SCANNED ${successCount}] Updated game appId ${appId} in Neon Database (Progress: ${processedCount}/${targetAppIds.length})`);
+      }
+    }
+    // Safe pacing delay: 350ms between requests keeps Steam API completely happy
+    await new Promise((r) => setTimeout(r, 350));
   }
 
-  console.log(`🎉 Elite Scanner Execution Completed! Total updated: ${successCount}/${targetAppIds.length} games in Neon Database.`);
+  console.log(`🎉 Scan Execution Completed! Total valid games updated: ${successCount}/${targetAppIds.length} in Neon Database.`);
 }
 
 run().catch((e) => {
