@@ -5,6 +5,11 @@ on:
     - cron: "17 1 * * *"
     - cron: "15 14 * * *"
   workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Batch size of games to scan"
+        required: false
+        default: "10000"
 
 jobs:
   scan:
@@ -26,3 +31,4 @@ jobs:
           node .github/workflows/standalone-scan.js
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BATCH_SIZE: ${{ inputs.batch_size || '1000' }}
