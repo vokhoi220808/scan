@@ -16,6 +16,14 @@ const TOP_POPULAR_APP_IDS = [
   1172470, 252490, 359550, 1086940, 1172620, 1599340, 1938090, 548430, 1085660, 1623730
 ];
 
+// Generate comprehensive search keywords (Single letters a-z, numbers 0-9, and common 2-letter prefixes)
+const SEARCH_KEYWORDS = [];
+for (let i = 97; i <= 122; i++) SEARCH_KEYWORDS.push(String.fromCharCode(i));
+for (let i = 0; i <= 9; i++) SEARCH_KEYWORDS.push(String(i));
+const POPULAR_PREFIXES = ["th", "st", "re", "co", "pa", "sh", "ba", "ma", "ch", "su", "pr", "de", "fi", "gr", "ha", "le", "li", "mo", "no", "pl", "se", "si", "tr", "vi", "wa"];
+SEARCH_KEYWORDS.push(...POPULAR_PREFIXES);
+SEARCH_KEYWORDS.push("war", "craft", "simulator", "2024", "legend", "hero", "quest", "city", "shadow", "world", "dead", "star", "dark", "super", "monster", "fantasy", "online", "edition", "remastered", "bundle");
+
 async function ensureTables() {
   console.log("🛠 Verifying/Creating PostgreSQL tables in Neon...");
 
@@ -93,9 +101,9 @@ async function ensureTables() {
 }
 
 /**
- * Fetch top popular games list dynamically across multiple Steam Store endpoints
+ * Fetch top popular games list dynamically across multiple Steam Store endpoints (Guaranteed 10,000 target)
  */
-async function getTopTargetAppIds(limit = 1000) {
+async function getTop10kTargetAppIds(limit = 10000) {
   const resultAppIds = [];
   const seen = new Set();
 
@@ -106,7 +114,7 @@ async function getTopTargetAppIds(limit = 1000) {
     }
   };
 
-  // Priority 1: Top Seed Games
+  // Priority 1: Top Seed Popular Games
   TOP_POPULAR_APP_IDS.forEach(add);
 
   // Priority 2: Fetch Steam Featured Specials
@@ -148,34 +156,46 @@ async function getTopTargetAppIds(limit = 1000) {
     // Table might be brand new
   }
 
-  // Priority 4: Steam Store Search Pagination (Page by page up to target limit)
-  console.log(`🌐 Fetching Steam Store Search pages to build scan list up to ${limit} games...`);
-  let start = 0;
-  const count = 50;
-  const maxPages = 30; // 30 * 50 = 1500 games per run
-  let page = 0;
-
-  while (resultAppIds.length < limit && page < maxPages) {
+  // Priority 4: Search keyword loop until 10,000 items are reached
+  console.log(`🌐 Searching Steam Store across ${SEARCH_KEYWORDS.length} keywords to reach target ${limit} games...`);
+  for (const keyword of SEARCH_KEYWORDS) {
+    if (resultAppIds.length >= limit) break;
     try {
-      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=&cc=VN&l=vietnamese&start=${start}&count=${count}`;
+      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(keyword)}&cc=VN&l=vietnamese&start=0&count=50`;
       const searchRes = await fetch(searchUrl, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
-      if (!searchRes.ok) break;
+      if (!searchRes.ok) continue;
       const searchData = await searchRes.json();
       const items = searchData?.items || [];
-      if (items.length === 0) break;
       items.forEach((item) => {
         if (item?.id) add(Number(item.id));
       });
-      start += count;
-      page++;
-      await new Promise((r) => setTimeout(r, 200)); // Small delay between search pages
-    } catch (err) {
-      console.warn(`Search page ${page} error:`, err?.message || err);
-      break;
+      await new Promise((r) => setTimeout(r, 100)); // Fast 100ms delay
+    } catch {
+      // Ignore individual search term errors
     }
   }
 
-  console.log(`🎯 Final Target scan list ready: ${resultAppIds.length} popular games scheduled for scan.`);
+  // Priority 5: Fallback chunked Steam Official Catalog API if still under 10,000
+  if (resultAppIds.length < limit) {
+    try {
+      console.log(`🌐 Fetching official Steam catalog list to complete 10,000 games target...`);
+      const catRes = await fetch("https://api.steampowered.com/ISteamApps/GetAppList/v2/");
+      if (catRes.ok) {
+        const catData = await catRes.json();
+        const apps = catData?.applist?.apps || [];
+        for (const app of apps) {
+          if (resultAppIds.length >= limit) break;
+          if (app.appid && app.name && app.name.trim().length > 0) {
+            add(Number(app.appid));
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Could not fetch Steam catalog API:", err?.message || err);
+    }
+  }
+
+  console.log(`🎯 Final Target scan list ready: ${resultAppIds.length} games scheduled for scan.`);
   return resultAppIds.slice(0, limit);
 }
 
@@ -190,12 +210,14 @@ async function scanGame(appId) {
 }
 
 async function run() {
-  console.log("🚀 Starting Large-Scale Steam Price Scan against Neon Database...");
+  console.log("🚀 Starting 10,000 Games Steam Scan against Neon Database...");
   await ensureTables();
 
-  const scanLimit = parseInt(process.env.BATCH_SIZE || "500", 10);
-  const targetAppIds = await getTopTargetAppIds(scanLimit);
+  const scanLimit = parseInt(process.env.BATCH_SIZE || "10000", 10);
+  const targetAppIds = await getTop10kTargetAppIds(scanLimit);
   let success = 0;
+
+  console.log(`🔥 Executing scan loop for ${targetAppIds.length} games...`);
 
   for (const appId of targetAppIds) {
     try {
@@ -238,13 +260,13 @@ async function run() {
 
       console.log(`✅ [SCANNED ${success + 1}/${targetAppIds.length}] ${name} (${appId}): ${finalPrice.toLocaleString("vi-VN")} VND (-${discountPercent}%)`);
       success++;
-      await new Promise((r) => setTimeout(r, 400)); // 400ms delay rate limit for fast throughput
+      await new Promise((r) => setTimeout(r, 200)); // High-speed 200ms delay
     } catch (err) {
       console.error(`❌ Error scanning appId ${appId}:`, err?.message || err);
     }
   }
 
-  console.log(`🎉 Large-Scale Scan Completed! Total updated: ${success}/${targetAppIds.length} games in Neon Database.`);
+  console.log(`🎉 10,000 Games Scan Completed! Total updated: ${success}/${targetAppIds.length} games in Neon Database.`);
 }
 
 run().catch((e) => {
