@@ -8,7 +8,7 @@ if (!dbUrl) {
 
 const sql = neon(dbUrl);
 
-// Top 50 Seed App IDs of most popular games on Steam (Elden Ring, Wukong, CS2, Dota 2, GTA V, Stardew Valley, etc.)
+// Top 50 Seed App IDs of most popular games on Steam
 const TOP_POPULAR_APP_IDS = [
   730, 570, 271590, 1091500, 1245620, 2357570, 413150, 105600, 588650, 367520,
   1145360, 504230, 268910, 292030, 550, 322330, 814380, 1174180, 1426210, 374320,
@@ -95,11 +95,11 @@ async function ensureTables() {
 /**
  * Prioritize Top 10,000 Most Popular & Discounted Steam Games
  */
-async function getTop10kTargetAppIds(limit = 10000): Promise<number[]> {
-  const resultAppIds: number[] = [];
-  const seen = new Set<number>();
+async function getTop10kTargetAppIds(limit = 10000) {
+  const resultAppIds = [];
+  const seen = new Set();
 
-  const add = (id: number) => {
+  const add = (id) => {
     if (id && !seen.has(id)) {
       seen.add(id);
       resultAppIds.push(id);
@@ -129,7 +129,7 @@ async function getTop10kTargetAppIds(limit = 10000): Promise<number[]> {
     console.warn("Could not fetch Steam featured specials:", err?.message || err);
   }
 
-  // Priority 3: Fetch existing games from database sorted by priority (on sale first, then oldest checked)
+  // Priority 3: Fetch existing games from database sorted by priority
   try {
     const dbGames = await sql`
       SELECT g.app_id 
@@ -146,7 +146,7 @@ async function getTop10kTargetAppIds(limit = 10000): Promise<number[]> {
     // Table might be brand new
   }
 
-  // Priority 4: Fill up to 10,000 target limit from Steam official Catalog API
+  // Priority 4: Fill up to target limit from Steam official Catalog API
   if (resultAppIds.length < limit) {
     try {
       console.log(`🌐 Fetching official Steam catalog list to reach top ${limit} games...`);
@@ -169,7 +169,7 @@ async function getTop10kTargetAppIds(limit = 10000): Promise<number[]> {
   return resultAppIds.slice(0, limit);
 }
 
-async function scanGame(appId: number) {
+async function scanGame(appId) {
   const url = `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=VN&l=vietnamese`;
   const res = await fetch(url, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
   if (!res.ok) return null;
