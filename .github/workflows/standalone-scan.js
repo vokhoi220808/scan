@@ -8,7 +8,7 @@ if (!dbUrl) {
 
 const sql = neon(dbUrl);
 
-// Top 50 Seed App IDs of most popular games on Steam
+// Seed App IDs of top popular global games
 const TOP_POPULAR_APP_IDS = [
   730, 570, 271590, 1091500, 1245620, 2357570, 413150, 105600, 588650, 367520,
   1145360, 504230, 268910, 292030, 550, 322330, 814380, 1174180, 1426210, 374320,
@@ -93,9 +93,9 @@ async function ensureTables() {
 }
 
 /**
- * Prioritize Top 10,000 Most Popular & Discounted Steam Games
+ * Fetch top popular games list dynamically across multiple Steam Store endpoints
  */
-async function getTop10kTargetAppIds(limit = 10000) {
+async function getTopTargetAppIds(limit = 1000) {
   const resultAppIds = [];
   const seen = new Set();
 
@@ -106,13 +106,15 @@ async function getTop10kTargetAppIds(limit = 10000) {
     }
   };
 
-  // Priority 1: Add seed list of top popular global games
+  // Priority 1: Top Seed Games
   TOP_POPULAR_APP_IDS.forEach(add);
 
-  // Priority 2: Fetch Steam Featured Specials (games currently on sale in VN region)
+  // Priority 2: Fetch Steam Featured Specials
   try {
     console.log("🔥 Fetching Steam Featured Specials (top discounted games in VN region)...");
-    const specRes = await fetch("https://store.steampowered.com/api/featuredcategories/?cc=VN&l=vietnamese");
+    const specRes = await fetch("https://store.steampowered.com/api/featuredcategories/?cc=VN&l=vietnamese", {
+      headers: { "User-Agent": "SteamPriceVN/1.0" }
+    });
     if (specRes.ok) {
       const specData = await specRes.json();
       const featuredItems = [
@@ -129,7 +131,7 @@ async function getTop10kTargetAppIds(limit = 10000) {
     console.warn("Could not fetch Steam featured specials:", err?.message || err);
   }
 
-  // Priority 3: Fetch existing games from database sorted by priority
+  // Priority 3: Fetch existing tracked games from Neon DB
   try {
     const dbGames = await sql`
       SELECT g.app_id 
@@ -146,26 +148,34 @@ async function getTop10kTargetAppIds(limit = 10000) {
     // Table might be brand new
   }
 
-  // Priority 4: Fill up to target limit from Steam official Catalog API
-  if (resultAppIds.length < limit) {
+  // Priority 4: Steam Store Search Pagination (Page by page up to target limit)
+  console.log(`🌐 Fetching Steam Store Search pages to build scan list up to ${limit} games...`);
+  let start = 0;
+  const count = 50;
+  const maxPages = 30; // 30 * 50 = 1500 games per run
+  let page = 0;
+
+  while (resultAppIds.length < limit && page < maxPages) {
     try {
-      console.log(`🌐 Fetching official Steam catalog list to reach top ${limit} games...`);
-      const catRes = await fetch("https://api.steampowered.com/ISteamApps/GetAppList/v2/");
-      if (catRes.ok) {
-        const catData = await catRes.json();
-        const apps = catData?.applist?.apps || [];
-        for (const app of apps) {
-          if (resultAppIds.length >= limit) break;
-          if (app.appid && app.name && app.name.trim().length > 0) {
-            add(Number(app.appid));
-          }
-        }
-      }
+      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=&cc=VN&l=vietnamese&start=${start}&count=${count}`;
+      const searchRes = await fetch(searchUrl, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
+      if (!searchRes.ok) break;
+      const searchData = await searchRes.json();
+      const items = searchData?.items || [];
+      if (items.length === 0) break;
+      items.forEach((item) => {
+        if (item?.id) add(Number(item.id));
+      });
+      start += count;
+      page++;
+      await new Promise((r) => setTimeout(r, 200)); // Small delay between search pages
     } catch (err) {
-      console.warn("Could not fetch Steam catalog API:", err?.message || err);
+      console.warn(`Search page ${page} error:`, err?.message || err);
+      break;
     }
   }
 
+  console.log(`🎯 Final Target scan list ready: ${resultAppIds.length} popular games scheduled for scan.`);
   return resultAppIds.slice(0, limit);
 }
 
@@ -180,14 +190,12 @@ async function scanGame(appId) {
 }
 
 async function run() {
-  console.log("🚀 Starting Prioritized 10,000 Popular Games Steam Scan...");
+  console.log("🚀 Starting Large-Scale Steam Price Scan against Neon Database...");
   await ensureTables();
 
-  const scanLimit = parseInt(process.env.BATCH_SIZE || "10000", 10);
-  const targetAppIds = await getTop10kTargetAppIds(scanLimit);
+  const scanLimit = parseInt(process.env.BATCH_SIZE || "500", 10);
+  const targetAppIds = await getTopTargetAppIds(scanLimit);
   let success = 0;
-
-  console.log(`🎯 Priority 10k scan list ready: ${targetAppIds.length} top games scheduled.`);
 
   for (const appId of targetAppIds) {
     try {
@@ -218,15 +226,25 @@ async function run() {
         ON CONFLICT (game_id, currency) DO UPDATE SET initial_price = ${initialPrice}, final_price = ${finalPrice}, discount_percent = ${discountPercent}, source_checked_at = ${now}, updated_at = ${now};
       `;
 
+      // 3. Upsert lowest price
+      await sql`
+        INSERT INTO lowest_prices (id, game_id, currency, price, first_recorded_at, last_recorded_at, updated_at)
+        VALUES (${`lowest_${appId}`}, ${gameId}, 'VND', ${finalPrice}, ${now}, ${now}, ${now})
+        ON CONFLICT (game_id, currency) DO UPDATE SET
+          price = LEAST(lowest_prices.price, EXCLUDED.price),
+          last_recorded_at = CASE WHEN EXCLUDED.price <= lowest_prices.price THEN EXCLUDED.last_recorded_at ELSE lowest_prices.last_recorded_at END,
+          updated_at = EXCLUDED.updated_at;
+      `;
+
       console.log(`✅ [SCANNED ${success + 1}/${targetAppIds.length}] ${name} (${appId}): ${finalPrice.toLocaleString("vi-VN")} VND (-${discountPercent}%)`);
       success++;
-      await new Promise((r) => setTimeout(r, 600)); // 600ms rate limit delay for high speed
+      await new Promise((r) => setTimeout(r, 400)); // 400ms delay rate limit for fast throughput
     } catch (err) {
       console.error(`❌ Error scanning appId ${appId}:`, err?.message || err);
     }
   }
 
-  console.log(`🎉 10,000 Popular Games scan completed! Total updated: ${success}/${targetAppIds.length} games in Neon Database.`);
+  console.log(`🎉 Large-Scale Scan Completed! Total updated: ${success}/${targetAppIds.length} games in Neon Database.`);
 }
 
 run().catch((e) => {
