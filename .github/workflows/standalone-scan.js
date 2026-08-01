@@ -16,13 +16,16 @@ const TOP_POPULAR_APP_IDS = [
   1172470, 252490, 359550, 1086940, 1172620, 1599340, 1938090, 548430, 1085660, 1623730
 ];
 
-// Generate comprehensive search keywords (Single letters a-z, numbers 0-9, and common 2-letter prefixes)
+// Generate 2-letter & 3-letter search combinations for massive catalog discovery
 const SEARCH_KEYWORDS = [];
-for (let i = 97; i <= 122; i++) SEARCH_KEYWORDS.push(String.fromCharCode(i));
-for (let i = 0; i <= 9; i++) SEARCH_KEYWORDS.push(String(i));
-const POPULAR_PREFIXES = ["th", "st", "re", "co", "pa", "sh", "ba", "ma", "ch", "su", "pr", "de", "fi", "gr", "ha", "le", "li", "mo", "no", "pl", "se", "si", "tr", "vi", "wa"];
-SEARCH_KEYWORDS.push(...POPULAR_PREFIXES);
-SEARCH_KEYWORDS.push("war", "craft", "simulator", "2024", "legend", "hero", "quest", "city", "shadow", "world", "dead", "star", "dark", "super", "monster", "fantasy", "online", "edition", "remastered", "bundle");
+for (let i = 97; i <= 122; i++) {
+  for (let j = 97; j <= 122; j++) {
+    SEARCH_KEYWORDS.push(String.fromCharCode(i) + String.fromCharCode(j));
+  }
+}
+// Add high-volume 3-letter game tags
+const EXTRA_TAGS = ["pro", "sim", "war", "run", "red", "out", "sub", "sea", "sky", "fly", "bot", "god", "man", "one", "box", "pub", "rpg", "fps"];
+SEARCH_KEYWORDS.push(...EXTRA_TAGS);
 
 async function ensureTables() {
   console.log("🛠 Verifying/Creating PostgreSQL tables in Neon...");
@@ -101,9 +104,9 @@ async function ensureTables() {
 }
 
 /**
- * Fetch top popular games list dynamically across multiple Steam Store endpoints (Guaranteed 10,000 target)
+ * Fetch top popular games list dynamically across multiple Steam Store endpoints (Target 20,000+)
  */
-async function getTop10kTargetAppIds(limit = 10000) {
+async function getMassiveTargetAppIds(limit = 20000) {
   const resultAppIds = [];
   const seen = new Set();
 
@@ -156,12 +159,12 @@ async function getTop10kTargetAppIds(limit = 10000) {
     // Table might be brand new
   }
 
-  // Priority 4: Search keyword loop until 10,000 items are reached
-  console.log(`🌐 Searching Steam Store across ${SEARCH_KEYWORDS.length} keywords to reach target ${limit} games...`);
-  for (const keyword of SEARCH_KEYWORDS) {
+  // Priority 4: Multi-Keyword Parallel Search Engine to reach target limit
+  console.log(`🌐 Searching Steam Store across keywords to build massive target scan list...`);
+  for (const prefix of SEARCH_KEYWORDS) {
     if (resultAppIds.length >= limit) break;
     try {
-      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(keyword)}&cc=VN&l=vietnamese&start=0&count=50`;
+      const searchUrl = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(prefix)}&cc=VN&l=vietnamese&start=0&count=50`;
       const searchRes = await fetch(searchUrl, { headers: { "User-Agent": "SteamPriceVN/1.0" } });
       if (!searchRes.ok) continue;
       const searchData = await searchRes.json();
@@ -169,29 +172,9 @@ async function getTop10kTargetAppIds(limit = 10000) {
       items.forEach((item) => {
         if (item?.id) add(Number(item.id));
       });
-      await new Promise((r) => setTimeout(r, 100)); // Fast 100ms delay
+      await new Promise((r) => setTimeout(r, 40)); // High-speed 40ms delay
     } catch {
       // Ignore individual search term errors
-    }
-  }
-
-  // Priority 5: Fallback chunked Steam Official Catalog API if still under 10,000
-  if (resultAppIds.length < limit) {
-    try {
-      console.log(`🌐 Fetching official Steam catalog list to complete 10,000 games target...`);
-      const catRes = await fetch("https://api.steampowered.com/ISteamApps/GetAppList/v2/");
-      if (catRes.ok) {
-        const catData = await catRes.json();
-        const apps = catData?.applist?.apps || [];
-        for (const app of apps) {
-          if (resultAppIds.length >= limit) break;
-          if (app.appid && app.name && app.name.trim().length > 0) {
-            add(Number(app.appid));
-          }
-        }
-      }
-    } catch (err) {
-      console.warn("Could not fetch Steam catalog API:", err?.message || err);
     }
   }
 
@@ -209,64 +192,98 @@ async function scanGame(appId) {
   return entry.data;
 }
 
+/**
+ * Process a single game item into Neon Database
+ */
+async function processSingleGame(appId) {
+  const data = await scanGame(appId);
+  if (!data) return false;
+
+  const name = data.name || `App ${appId}`;
+  const isFree = data.is_free ? 1 : 0;
+  const priceOverview = data.price_overview;
+  const initialPrice = priceOverview ? Math.round(priceOverview.initial / 100) : 0;
+  const finalPrice = priceOverview ? Math.round(priceOverview.final / 100) : 0;
+  const discountPercent = priceOverview ? priceOverview.discount_percent : 0;
+  const headerImage = data.header_image || `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/header.jpg`;
+  const capsuleImage = data.capsule_image || `https://cdn.akamai.steamstatic.com/steam/apps/${appId}/capsule_616x353.jpg`;
+  const shortDesc = data.short_description || "";
+  const developers = Array.isArray(data.developers) ? data.developers.join(", ") : "Chưa cập nhật";
+  const publishers = Array.isArray(data.publishers) ? data.publishers.join(", ") : "Chưa cập nhật";
+  const releaseDate = data.release_date?.date || "Chưa cập nhật";
+  const now = new Date().toISOString();
+  const gameId = `game_${appId}`;
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `app-${appId}`;
+  const fingerprint = [gameId, "VND", initialPrice, finalPrice, discountPercent, isFree].join(":");
+
+  // 1. Upsert game with rich metadata
+  await sql`
+    INSERT INTO games (
+      id, app_id, name, slug, type, short_description, developer, publisher,
+      release_date, header_image_url, capsule_image_url, store_url, is_free,
+      is_released, is_available, is_tracked, metadata_status, metadata_updated_at, created_at, updated_at
+    ) VALUES (
+      ${gameId}, ${appId}, ${name}, ${slug}, 'game', ${shortDesc}, ${developers}, ${publishers},
+      ${releaseDate}, ${headerImage}, ${capsuleImage}, ${`https://store.steampowered.com/app/${appId}`}, ${isFree},
+      1, 1, 1, 'READY', ${now}, ${now}, ${now}
+    )
+    ON CONFLICT (app_id) DO UPDATE SET
+      name = EXCLUDED.name,
+      short_description = EXCLUDED.short_description,
+      developer = EXCLUDED.developer,
+      publisher = EXCLUDED.publisher,
+      header_image_url = EXCLUDED.header_image_url,
+      capsule_image_url = EXCLUDED.capsule_image_url,
+      updated_at = EXCLUDED.updated_at;
+  `;
+
+  // 2. Upsert current price
+  await sql`
+    INSERT INTO current_prices (id, game_id, currency, initial_price, final_price, discount_percent, is_free, is_on_sale, source, source_checked_at, created_at, updated_at)
+    VALUES (${`cprice_${appId}`}, ${gameId}, 'VND', ${initialPrice}, ${finalPrice}, ${discountPercent}, ${isFree}, ${discountPercent > 0 ? 1 : 0}, 'steam_store', ${now}, ${now}, ${now})
+    ON CONFLICT (game_id, currency) DO UPDATE SET initial_price = ${initialPrice}, final_price = ${finalPrice}, discount_percent = ${discountPercent}, source_checked_at = ${now}, updated_at = ${now};
+  `;
+
+  // 3. Insert price history on price change
+  await sql`
+    INSERT INTO price_history (id, game_id, currency, initial_price, final_price, discount_percent, is_free, is_on_sale, fingerprint, source, recorded_at)
+    VALUES (${`phist_${appId}_${Date.now()}`}, ${gameId}, 'VND', ${initialPrice}, ${finalPrice}, ${discountPercent}, ${isFree}, ${discountPercent > 0 ? 1 : 0}, ${fingerprint}, 'steam_store', ${now});
+  `;
+
+  // 4. Upsert lowest price (All-Time Low)
+  await sql`
+    INSERT INTO lowest_prices (id, game_id, currency, price, first_recorded_at, last_recorded_at, updated_at)
+    VALUES (${`lowest_${appId}`}, ${gameId}, 'VND', ${finalPrice}, ${now}, ${now}, ${now})
+    ON CONFLICT (game_id, currency) DO UPDATE SET
+      price = LEAST(lowest_prices.price, EXCLUDED.price),
+      last_recorded_at = CASE WHEN EXCLUDED.price <= lowest_prices.price THEN EXCLUDED.last_recorded_at ELSE lowest_prices.last_recorded_at END,
+      updated_at = EXCLUDED.updated_at;
+  `;
+
+  console.log(`✅ [SCANNED] ${name} (${appId}): ${finalPrice.toLocaleString("vi-VN")} VND (-${discountPercent}%)`);
+  return true;
+}
+
 async function run() {
-  console.log("🚀 Starting 10,000 Games Steam Scan against Neon Database...");
+  console.log("🚀 Starting Elite Parallel High-Performance Steam Scanner against Neon Database...");
   await ensureTables();
 
-  const scanLimit = parseInt(process.env.BATCH_SIZE || "10000", 10);
-  const targetAppIds = await getTop10kTargetAppIds(scanLimit);
-  let success = 0;
+  const scanLimit = parseInt(process.env.BATCH_SIZE || "20000", 10);
+  const targetAppIds = await getMassiveTargetAppIds(scanLimit);
+  let successCount = 0;
+  const CONCURRENCY = 5; // 5 parallel streams for maximum speed
 
-  console.log(`🔥 Executing scan loop for ${targetAppIds.length} games...`);
+  console.log(`🔥 Executing Parallel Scan Engine for ${targetAppIds.length} games (Concurrency: ${CONCURRENCY})...`);
 
-  for (const appId of targetAppIds) {
-    try {
-      const data = await scanGame(appId);
-      if (!data) continue;
-
-      const name = data.name || `App ${appId}`;
-      const isFree = data.is_free ? 1 : 0;
-      const priceOverview = data.price_overview;
-      const initialPrice = priceOverview ? Math.round(priceOverview.initial / 100) : 0;
-      const finalPrice = priceOverview ? Math.round(priceOverview.final / 100) : 0;
-      const discountPercent = priceOverview ? priceOverview.discount_percent : 0;
-      const now = new Date().toISOString();
-      const gameId = `game_${appId}`;
-      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `app-${appId}`;
-
-      // 1. Upsert game
-      await sql`
-        INSERT INTO games (id, app_id, name, slug, type, is_free, is_released, is_available, is_tracked, created_at, updated_at)
-        VALUES (${gameId}, ${appId}, ${name}, ${slug}, 'game', ${isFree}, 1, 1, 1, ${now}, ${now})
-        ON CONFLICT (app_id) DO UPDATE SET name = ${name}, updated_at = ${now};
-      `;
-
-      // 2. Upsert current price
-      await sql`
-        INSERT INTO current_prices (id, game_id, currency, initial_price, final_price, discount_percent, is_free, is_on_sale, source, source_checked_at, created_at, updated_at)
-        VALUES (${`cprice_${appId}`}, ${gameId}, 'VND', ${initialPrice}, ${finalPrice}, ${discountPercent}, ${isFree}, ${discountPercent > 0 ? 1 : 0}, 'steam_store', ${now}, ${now}, ${now})
-        ON CONFLICT (game_id, currency) DO UPDATE SET initial_price = ${initialPrice}, final_price = ${finalPrice}, discount_percent = ${discountPercent}, source_checked_at = ${now}, updated_at = ${now};
-      `;
-
-      // 3. Upsert lowest price
-      await sql`
-        INSERT INTO lowest_prices (id, game_id, currency, price, first_recorded_at, last_recorded_at, updated_at)
-        VALUES (${`lowest_${appId}`}, ${gameId}, 'VND', ${finalPrice}, ${now}, ${now}, ${now})
-        ON CONFLICT (game_id, currency) DO UPDATE SET
-          price = LEAST(lowest_prices.price, EXCLUDED.price),
-          last_recorded_at = CASE WHEN EXCLUDED.price <= lowest_prices.price THEN EXCLUDED.last_recorded_at ELSE lowest_prices.last_recorded_at END,
-          updated_at = EXCLUDED.updated_at;
-      `;
-
-      console.log(`✅ [SCANNED ${success + 1}/${targetAppIds.length}] ${name} (${appId}): ${finalPrice.toLocaleString("vi-VN")} VND (-${discountPercent}%)`);
-      success++;
-      await new Promise((r) => setTimeout(r, 200)); // High-speed 200ms delay
-    } catch (err) {
-      console.error(`❌ Error scanning appId ${appId}:`, err?.message || err);
-    }
+  for (let i = 0; i < targetAppIds.length; i += CONCURRENCY) {
+    const chunk = targetAppIds.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(chunk.map((appId) => processSingleGame(appId)));
+    successCount += results.filter(Boolean).length;
+    console.log(`⚡ Progress: ${successCount}/${targetAppIds.length} games processed.`);
+    await new Promise((r) => setTimeout(r, 200)); // Smooth 200ms delay between parallel batches
   }
 
-  console.log(`🎉 10,000 Games Scan Completed! Total updated: ${success}/${targetAppIds.length} games in Neon Database.`);
+  console.log(`🎉 Elite Scanner Execution Completed! Total updated: ${successCount}/${targetAppIds.length} games in Neon Database.`);
 }
 
 run().catch((e) => {
